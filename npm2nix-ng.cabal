@@ -13,7 +13,7 @@ executable npm2nix
   build-depends:       base
                      , HsOpenSSL
                      , aeson
-                     , ansi-terminal
+                     , ansi-wl-pprint
                      , base64-bytestring
                      , bytestring
                      , containers

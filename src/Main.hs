@@ -40,13 +40,13 @@ import           PackageTypes
 import           Prefetch
 import           Prelude                         hiding (log)
 import           Proc
-import           System.Console.ANSI
 import           System.Directory
 import           System.FilePath
 import           System.IO
 import           System.IO.Temp
 import           System.IO.Unsafe
 import           System.Process                  (CreateProcess (..), proc)
+import           Text.PrettyPrint.ANSI.Leijen    hiding ((<$>), (</>), (<>))
 import           Types
 
 promise :: MonadBaseControl IO m => m a -> m (MVar a)
@@ -115,21 +115,18 @@ getSpec :: MonadFetch m => Text -> m ByteString
 getSpec pkg = getCache specCache pkg $ do
     Fetcher{..} <- ask
     r <- requestOpts
-    log $ do
-        logFetch
-        logStr "registry"
-        logSGR [Reset]
-        logStr " "
-        logStrLn $ registry <> "/" <> unpack pkg
+    log $ dullgreen "fetch"
+      <+> ondullblack "registry"
+      <+> string (registry <> "/" <> unpack pkg)
     resp <- liftIO $ getWith r (registry <> "/" <> unpack pkg)
     return $ resp ^. responseBody
 
 getSpecMatching :: MonadFetch m => PackageReq -> m PackageSpec
 getSpecMatching r@(PackageReq pkg vRange) = getCache reqCache r $ case vRange of
     VersionRange tr -> getRegistryMatching pkg tr
-    GitHub _ -> logError $ logStrLn $ "getGitHubMatching " ++ show r
+    GitHub _ -> logError $ string $ "getGitHubMatching " ++ show r
     Git uri -> getGit uri
-    Http _ -> logError $ logStrLn $ "getTarballMatching " ++ show r
+    Http _ -> logError $ string $ "getTarballMatching " ++ show r
 
 getRegistryMatching :: MonadFetch m => Text -> TaggedRange -> m PackageSpec
 getRegistryMatching pkg (TaggedRange targetSV targetText) = do
@@ -138,8 +135,14 @@ getRegistryMatching pkg (TaggedRange targetSV targetText) = do
         Right allSVs = mapM parseSemVer allVersions
     vers <- case bestMatch' targetSV allSVs of
         Right vers -> return $ renderSV vers
-        Left _ -> logError $
-            logStrLn $ "No '" ++ unpack pkg ++ "' version matching " ++ unpack targetText ++ " in " ++ show allVersions
+        Left _ -> logError $ fillSep
+            [ "No"
+            , squotes (string $ unpack pkg)
+            , "version matching"
+            , string (unpack targetText)
+            , "in"
+            , string (show allVersions)
+            ]
     let spec2 = fromJSON $ spec ^?! key "versions" . key vers :: Result PackageSpec
     case spec2 of
         Data.Aeson.Success p@PackageSpec{..} -> do
@@ -150,12 +153,8 @@ getRegistryMatching pkg (TaggedRange targetSV targetText) = do
                     shasum <- prefetchUrl tb
                     return $ SourceURL tb shasum
             return p { psMatch = psMatch { source = src } }
-        Error s -> logError $ do
-            logSGR [SetColor Foreground Dull Yellow]
-            logStr $ "fetching " ++ showShortSpec pkg targetText ++ " "
-            logSGR [Reset]
-            logStrLn s
-            logPrint (spec ^?! key "versions" . key vers)
+        Error s -> logError $ yellow ("fetching" <+> string (showShortSpec pkg targetText)) <+> string s
+                         <$$> string (show $ spec ^?! key "versions" . key vers)
     where
         bestMatch' range vs = case filter (matches' range) vs of
             [] -> Left ("No matching versions" :: String)
@@ -168,20 +167,9 @@ getRegistryMatching pkg (TaggedRange targetSV targetText) = do
             (_, _) -> False
         sharedReleaseTags' range = listToMaybe $ map svReleaseTags $ versionsOf range
 
-logFetch :: LogM ()
-logFetch = do
-    logSGR [SetColor Foreground Dull Green]
-    logStr "fetch "
-    logSGR [Reset, SetColor Background Dull Black]
-
 getGit :: (MonadMask m, MonadFetch m) => URI -> m PackageSpec
 getGit uri = do
-    log $ do
-        logFetch
-        logStr "git"
-        logSGR [Reset]
-        logStr " "
-        logPrint uri
+    log $ dullgreen "fetch" <+> ondullblack "git" <+> string (show uri)
     withSystemTempDirectory "npm2nix-git-" $ \ fp -> do
         let uriStr = uriToString id (uri { uriFragment = "" }) ""
             targetUri = (if "git+" `isPrefixOf` uriStr then drop 4 else id) uriStr

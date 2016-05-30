@@ -1,63 +1,35 @@
 {-# LANGUAGE FlexibleContexts          #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
+{-# LANGUAGE OverloadedStrings         #-}
 
 module Logging where
 
 import Control.Concurrent.Chan.Lifted
 import Control.Concurrent.Lifted
-import Control.Exception.Lifted
 import Control.Monad.Trans.Control
-import GHC.IO.Handle
-import Prelude                        hiding (putStr, putStrLn)
-import System.Console.ANSI            hiding (setSGR)
+import Prelude                        hiding (log)
 import System.Exit
 import System.IO                      (stderr)
 import System.IO.Unsafe               (unsafePerformIO)
+import Text.PrettyPrint.ANSI.Leijen
 
-logChan :: Chan (LogM ())
+logChan :: Chan (Either () Doc)
 logChan = unsafePerformIO newChan
 {-# NOINLINE logChan #-}
 
-log :: MonadBaseControl IO m => LogM () -> m ()
-log = writeChan logChan
+log :: MonadBaseControl IO m => Doc -> m ()
+log = writeChan logChan . Right . (<> hardline)
 
-logError :: MonadBaseControl IO m => LogM () -> m a
-logError io = do
-    writeChan logChan $ do
-        logSGR [SetColor Foreground Dull Red]
-        logStr "ERROR "
-        logSGR [Reset]
-        io
-        LogM exitFailure
+logError :: MonadBaseControl IO m => Doc -> m a
+logError msg = do
+    log $ red "ERROR" <+> msg
+    writeChan logChan (Left ())
     threadDelay maxBound
     return undefined
 
 runLoggingWithParent :: ThreadId -> IO ()
 runLoggingWithParent tid = do
     io <- readChan logChan
-    res <- try (unLogM io)
-    case res of
-        Right () -> runLoggingWithParent tid
-        Left e -> throwTo tid (e :: ExitCode)
-
-newtype LogM a = LogM { unLogM :: IO a }
-
-instance Functor LogM where
-    fmap f (LogM a) = LogM (fmap f a)
-
-instance Applicative LogM where
-    LogM f <*> LogM a = LogM (f <*> a)
-    pure = LogM . pure
-
-instance Monad LogM where
-    return = LogM . return
-    LogM a >>= f = LogM $ a >>= unLogM . f
-
-logStr, logStrLn :: String -> LogM ()
-logSGR :: [SGR] -> LogM ()
-logPrint :: Show a => a -> LogM ()
-
-logStrLn s = logStr (s ++ "\n")
-logStr = LogM . hPutStr stderr
-logSGR = LogM . hSetSGR stderr
-logPrint = logStrLn . show
+    case io of
+        Left () -> throwTo tid $ ExitFailure 1
+        Right i -> hPutDoc stderr i >> runLoggingWithParent tid
