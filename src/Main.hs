@@ -9,7 +9,7 @@ module Main where
 
 import           Conf
 import           Control.Concurrent.Async.Lifted
-import           Control.Concurrent.Lifted       (fork, myThreadId, threadDelay)
+import           Control.Concurrent.Lifted       (fork, myThreadId)
 import           Control.Concurrent.MVar.Lifted
 import           Control.Lens
 import           Control.Monad.Catch             (MonadMask)
@@ -116,9 +116,7 @@ getSpec pkg = getCache specCache pkg $ do
     Fetcher{..} <- ask
     r <- requestOpts
     log $ do
-        logSGR [SetColor Foreground Dull Green]
-        logStr "fetch "
-        logSGR [Reset, SetColor Background Dull Black]
+        logFetch
         logStr "registry"
         logSGR [Reset]
         logStr " "
@@ -140,7 +138,7 @@ getRegistryMatching pkg (TaggedRange targetSV targetText) = do
         Right allSVs = mapM parseSemVer allVersions
     vers <- case bestMatch' targetSV allSVs of
         Right vers -> return $ renderSV vers
-        Left _ -> logError $ do
+        Left _ -> logError $
             logStrLn $ "No '" ++ unpack pkg ++ "' version matching " ++ unpack targetText ++ " in " ++ show allVersions
     let spec2 = fromJSON $ spec ^?! key "versions" . key vers :: Result PackageSpec
     case spec2 of
@@ -160,7 +158,7 @@ getRegistryMatching pkg (TaggedRange targetSV targetText) = do
             logPrint (spec ^?! key "versions" . key vers)
     where
         bestMatch' range vs = case filter (matches' range) vs of
-            [] -> Left $ do "No matching versions" :: String
+            [] -> Left ("No matching versions" :: String)
             vs' -> Right $ maximum vs'
         matches' range version = case (sharedReleaseTags' range, svReleaseTags version) of
             (_, []) -> matchesSimple range version
@@ -170,12 +168,16 @@ getRegistryMatching pkg (TaggedRange targetSV targetText) = do
             (_, _) -> False
         sharedReleaseTags' range = listToMaybe $ map svReleaseTags $ versionsOf range
 
+logFetch :: LogM ()
+logFetch = do
+    logSGR [SetColor Foreground Dull Green]
+    logStr "fetch "
+    logSGR [Reset, SetColor Background Dull Black]
+
 getGit :: (MonadMask m, MonadFetch m) => URI -> m PackageSpec
 getGit uri = do
     log $ do
-        logSGR [SetColor Foreground Dull Green]
-        logStr "fetch "
-        logSGR [Reset, SetColor Background Dull Black]
+        logFetch
         logStr "git"
         logSGR [Reset]
         logStr " "
@@ -275,22 +277,22 @@ hPrintTree h (PackageTree m@PackageMatch { pmName, version, bin = _, source } de
 
 showSource :: Handle -> Source -> IO ()
 showSource h (SourceURL u s) = do
-    hPutStrLn h $ "    src = fetchurl {"
+    hPutStrLn h   "    src = fetchurl {"
     hPutStrLn h $ "      url = \"" ++ unpack u ++ "\";"
     hPutStrLn h $ "      sha256 = \"" ++ unpack s ++ "\";";
-    hPutStrLn h $ "    };"
+    hPutStrLn h   "    };"
 showSource h (SourceGit u s r) = do
-    hPutStrLn h $ "    src = fetchgit {"
-    hPutStrLn h $ "      name = \"fetchgit-src\";"
+    hPutStrLn h   "    src = fetchgit {"
+    hPutStrLn h   "      name = \"fetchgit-src\";"
     hPutStrLn h $ "      url = \"" ++ unpack u ++ "\";"
-    hPutStrLn h $ "      sha256 = \"" ++ unpack s ++ "\";";
-    hPutStrLn h $ "      rev = \"" ++ unpack r ++ "\";";
-    hPutStrLn h $ "    };"
+    hPutStrLn h $ "      sha256 = \"" ++ unpack s ++ "\";"
+    hPutStrLn h $ "      rev = \"" ++ unpack r ++ "\";"
+    hPutStrLn h   "    };"
 showSource h (SourceFile f) = do
-    hPutStrLn h $ "    src = {"
-    hPutStrLn h $ "      outPath = " ++ unpack f ++ ";";
-    hPutStrLn h $ "      name = \"src\";";
-    hPutStrLn h $ "    };"
+    hPutStrLn h   "    src = {"
+    hPutStrLn h $ "      outPath = " ++ unpack f ++ ";"
+    hPutStrLn h   "      name = \"src\";"
+    hPutStrLn h   "    };"
 
 showReq :: PackageReq -> String
 showReq (PackageReq n r) = "\"" ++ unpack n ++ "\".\""

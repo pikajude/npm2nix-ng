@@ -4,7 +4,6 @@
 module Proc where
 
 import Control.Monad.IO.Class
-import Data.List              (intercalate)
 import Data.Text              (Text, strip)
 import Logging
 import Prelude                hiding (putStr)
@@ -24,6 +23,6 @@ runCreateProc inproc@CreateProcess { cmdspec = ~(RawCommand prc args) } = do
         ExitSuccess -> return $ strip t1
         ExitFailure _ -> logError $ do
             logSGR [SetColor Foreground Dull Yellow]
-            logStr $ intercalate " " (unpack prc : args) ++ " "
+            logStr $ unwords (unpack prc : args) ++ " "
             logSGR [Reset]
             logStrLn $ unpack t2
