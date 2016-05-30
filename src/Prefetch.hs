@@ -32,6 +32,6 @@ prefetchUrl txt = do
 
 prefetchGit :: MonadFetch m => String -> Text -> m Text
 prefetchGit url rev = do
-    log $ magenta "nix-prefetch-git" <+> string url <+> string (unpack rev)
+    log $ dullmagenta "nix-prefetch-git" <+> string url <+> string (unpack rev)
     out <- runProc "nix-prefetch-git" [url, unpack rev, "--fetch-submodules"]
     return $ out ^?! key "sha256" . _String
