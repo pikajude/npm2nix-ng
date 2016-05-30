@@ -1,18 +1,25 @@
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module PackageTypes where
 
+import           Control.Concurrent.MVar (MVar)
 import           Control.Lens
 import           Data.Aeson
 import           Data.Aeson.Types
-import qualified Data.HashMap.Strict as H
-import qualified Data.Map            as M
+import qualified Data.HashMap.Strict     as H
+import qualified Data.Map                as M
 import           Data.Maybe
 import           Data.SemVer
-import           Data.SemVer.Parser
-import           Data.Text           (Text, splitOn)
+import           Data.Text               (Text, splitOn)
 import           Data.Text.Lens
 import           Network.URI
+
+instance Show (MVar Source) where
+    show _ = "<fetching>"
+
+instance Ord (MVar Source) where
+    compare _ _ = EQ
 
 newtype SemVerJSON = SemVerJSON { unSVJ :: SemVer }
 
@@ -34,9 +41,9 @@ data PackageRange = PackageRange
                   } deriving (Show, Ord, Eq)
 
 data Req = VersionRange TaggedRange
-         | GitHub Text Text
-         | Git Text
-         | Http Text
+         | GitHub URI
+         | Git URI
+         | Http URI
          deriving (Eq, Ord, Show)
 
 data PackageReq = PackageReq
@@ -59,7 +66,7 @@ data Source = SourceURL
 data PackageMatch = PackageMatch
                   { pmName  :: Text
                   , version :: SemVer
-                  , source  :: Maybe Source
+                  , source  :: MVar Source
                   , bin     :: Bool
                   } deriving (Show, Ord, Eq)
 
@@ -68,7 +75,7 @@ data PackageSpec = PackageSpec
                  , psDependencies     :: [PackageReq]
                  , psDevDependencies  :: [PackageReq]
                  , psPeerDependencies :: [PackageReq]
-                 } deriving (Show, Ord, Eq)
+                 } deriving (Show, Eq)
 
 data PackageTree = PackageTree
                  { ptMatch            :: PackageMatch
@@ -92,22 +99,23 @@ instance FromJSON PackageMatch where
     parseJSON (Object v) = PackageMatch
         <$> v .: "name"
         <*> fmap unSVJ (v .: "version")
-        <*> pure Nothing
+        <*> pure (error "source not registered")
         <*> pure (isJust $ H.lookup "bin" v)
 
     parseJSON q = typeMismatch "PackageMatch" q
 
 instance FromJSON Req where
-    parseJSON (String "") = parseJSON (String "*")
+    parseJSON (String s)
+        | s `elem` ["", "latest"] = parseJSON (String "*")
     parseJSON (String s) = case parseSemVerRange s of
         Right v -> pure (VersionRange (TaggedRange v s))
         Left _ -> case parseURI (s ^. _Text) of
             Just uri -> case uriScheme uri of
                 "github:" -> case splitOn "/" (_Text # uriPath uri) of
-                    [u, h] -> pure (GitHub u h)
+                    [_, _] -> pure (GitHub uri)
                     _ -> fail $ uriPath uri ++ " doesn't look like a valid github req"
-                x | x `elem` ["git+https:", "git+http:", "git:"]
-                    -> pure (Git (_Text # show uri))
+                x | x `elem` ["git+https:", "git+http:", "git:"] -> pure (Git uri)
+                x | x `elem` ["https:", "http:"] -> pure (Http uri)
                 _ -> fail $ "unreadable URI " ++ show uri
             Nothing -> fail $ (s ^. _Text) ++ " not a URI nor a version"
 

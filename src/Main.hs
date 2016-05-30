@@ -9,49 +9,56 @@ module Main where
 
 import           Conf
 import           Control.Concurrent.Async.Lifted
-import           Control.Concurrent.Chan.Lifted
-import           Control.Concurrent.Lifted       (fork)
+import           Control.Concurrent.Lifted       (fork, myThreadId, threadDelay)
 import           Control.Concurrent.MVar.Lifted
 import           Control.Lens
+import           Control.Monad.Catch             (MonadMask)
 import           Control.Monad.IO.Class
 import           Control.Monad.Reader
 import           Control.Monad.Trans.Control     (MonadBaseControl)
 import           Data.Aeson
 import           Data.Aeson.Lens
 import qualified Data.ByteString                 as B
+import qualified Data.ByteString.Base64          as B64
 import           Data.ByteString.Lazy            (ByteString)
-import           Data.ByteString.UTF8            (fromString)
+import           Data.ByteString.UTF8            (fromString, toString)
+import           Data.List                       (isPrefixOf)
 import           Data.Map                        (Map)
 import qualified Data.Map                        as M
 import           Data.Maybe
-import           Data.SemVer                     (SemVerRange (Eq), bestMatch,
-                                                  renderSV)
-import           Data.SemVer.Parser
+import           Data.SemVer
 import qualified Data.Set                        as S
-import           Data.Text                       (Text, strip)
+import           Data.Text                       (Text)
 import           Data.Text.Lens
+import           Logging
+import           Network.HTTP.Client.OpenSSL
+import           Network.URI
 import           Network.Wreq
+import           OpenSSL.Session
 import           Options.Applicative
 import           PackageTypes
+import           Prefetch
 import           Prelude                         hiding (log)
+import           Proc
 import           System.Console.ANSI
 import           System.Directory
-import           System.Exit
 import           System.FilePath
 import           System.IO
+import           System.IO.Temp
 import           System.IO.Unsafe
-import           System.Process.Text
+import           System.Process                  (CreateProcess (..), proc)
+import           Types
+
+promise :: MonadBaseControl IO m => m a -> m (MVar a)
+promise io = do
+    mv <- newEmptyMVar
+    fork (io >>= putMVar mv) >> return mv
 
 data Opts = Opts
           { userConfig :: Bool
           , inFile     :: FilePath
           , outFile    :: Maybe FilePath
           } deriving Show
-
-data Fetcher = Fetcher
-             { registry      :: String
-             , authorization :: Maybe String
-             } deriving Show
 
 opts :: Parser Opts
 opts = Opts
@@ -70,9 +77,8 @@ requestOpts = do
     Fetcher{..} <- ask
     return $ defaults
         & Network.Wreq.header "Authorization"
-            .~ maybeToList (fmap (mappend "Basic " . fromString) authorization)
-
-type MonadFetch m = (MonadBaseControl IO m, MonadReader Fetcher m, MonadIO m)
+            .~ maybeToList (fmap (mappend "Basic " . B64.encode . fromString) authorization)
+        & manager .~ Left (opensslManagerSettings context)
 
 type Memcache key value = MVar (Map key (MVar value))
 
@@ -101,97 +107,103 @@ reqCache :: Memcache PackageReq PackageSpec
 reqCache = unsafePerformIO $ newMVar mempty
 {-# NOINLINE reqCache #-}
 
-sourceCache :: Memcache PackageMatch (Maybe Source)
+sourceCache :: Memcache PackageMatch (MVar Source)
 sourceCache = unsafePerformIO $ newMVar mempty
 {-# NOINLINE sourceCache #-}
-
-logChan :: Chan (IO ())
-logChan = unsafePerformIO newChan
-{-# NOINLINE logChan #-}
-
-log :: MonadBaseControl IO m => IO () -> m ()
-log = writeChan logChan
 
 getSpec :: MonadFetch m => Text -> m ByteString
 getSpec pkg = getCache specCache pkg $ do
     Fetcher{..} <- ask
     r <- requestOpts
     log $ do
-        setSGR [SetColor Foreground Dull Green]
-        putStr "fetch "
-        setSGR [Reset]
-        putStrLn $ registry <> "/" <> (pkg ^. _Text)
-    resp <- liftIO $ getWith r (registry <> "/" <> (pkg ^. _Text))
+        logSGR [SetColor Foreground Dull Green]
+        logStr "fetch "
+        logSGR [Reset, SetColor Background Dull Black]
+        logStr "registry"
+        logSGR [Reset]
+        logStr " "
+        logStrLn $ registry <> "/" <> unpack pkg
+    resp <- liftIO $ getWith r (registry <> "/" <> unpack pkg)
     return $ resp ^. responseBody
 
 getSpecMatching :: MonadFetch m => PackageReq -> m PackageSpec
 getSpecMatching r@(PackageReq pkg vRange) = getCache reqCache r $ case vRange of
     VersionRange tr -> getRegistryMatching pkg tr
-    GitHub _ _ -> error "getGitHubMatching r"
-    Git _ -> error "getGitMatching r"
-    Http _ -> error "getTarballMatching r"
+    GitHub _ -> logError $ logStrLn $ "getGitHubMatching " ++ show r
+    Git uri -> getGit uri
+    Http _ -> logError $ logStrLn $ "getTarballMatching " ++ show r
 
 getRegistryMatching :: MonadFetch m => Text -> TaggedRange -> m PackageSpec
 getRegistryMatching pkg (TaggedRange targetSV targetText) = do
     spec <- getSpec pkg
     let allVersions = spec ^.. key "versions" . _Object . ifolded . asIndex
         Right allSVs = mapM parseSemVer allVersions
-    vers <- case bestMatch targetSV allSVs of
+    vers <- case bestMatch' targetSV allSVs of
         Right vers -> return $ renderSV vers
-        Left _ -> do
-            log $ do
-                setSGR [SetColor Foreground Dull Red]
-                putStr "ERROR "
-                setSGR [Reset]
-                putStrLn $ "No version matching " ++ (targetText ^. _Text) ++ " in " ++ show allVersions
-                exitFailure
-            return undefined
+        Left _ -> logError $ do
+            logStrLn $ "No '" ++ unpack pkg ++ "' version matching " ++ unpack targetText ++ " in " ++ show allVersions
     let spec2 = fromJSON $ spec ^?! key "versions" . key vers :: Result PackageSpec
     case spec2 of
         Data.Aeson.Success p@PackageSpec{..} -> do
             src <- getCache sourceCache psMatch $ do
-                case spec ^? key "versions" . key vers . key "dist" of
-                    Just o -> do
-                        let tb = o ^?! key "tarball" . _String
-                        shasum <- prefetchUrl tb
-                        return $ Just $ SourceURL tb shasum
-                    Nothing -> return Nothing
+                let o = spec ^?! key "versions" . key vers . key "dist"
+                promise $ do
+                    let tb = o ^?! key "tarball" . _String
+                    shasum <- prefetchUrl tb
+                    return $ SourceURL tb shasum
             return p { psMatch = psMatch { source = src } }
-        Error s -> do
-            log $ do
-                setSGR [SetColor Foreground Dull Red]
-                putStr "ERROR "
-                setSGR [SetColor Foreground Dull Yellow]
-                putStr $ "fetching " ++ showShortSpec pkg targetText ++ " "
-                setSGR [Reset]
-                putStrLn s
-                print (spec ^?! key "versions" . key vers)
-                exitFailure
-            return undefined
+        Error s -> logError $ do
+            logSGR [SetColor Foreground Dull Yellow]
+            logStr $ "fetching " ++ showShortSpec pkg targetText ++ " "
+            logSGR [Reset]
+            logStrLn s
+            logPrint (spec ^?! key "versions" . key vers)
+    where
+        bestMatch' range vs = case filter (matches' range) vs of
+            [] -> Left $ do "No matching versions" :: String
+            vs' -> Right $ maximum vs'
+        matches' range version = case (sharedReleaseTags' range, svReleaseTags version) of
+            (_, []) -> matchesSimple range version
+            (Just rTags, vTags)
+                | rTags == vTags -> matchesSimple range version
+                | otherwise -> matchesTags range rTags vTags
+            (_, _) -> False
+        sharedReleaseTags' range = listToMaybe $ map svReleaseTags $ versionsOf range
 
-prefetchUrl :: (MonadIO m, MonadBaseControl IO m) => Text -> m Text
-prefetchUrl txt = do
+getGit :: (MonadMask m, MonadFetch m) => URI -> m PackageSpec
+getGit uri = do
     log $ do
-        setSGR [SetColor Foreground Dull Blue]
-        putStr "nix-prefetch-url "
-        setSGR [Reset]
-        putStrLn (txt ^. _Text)
-    (ec, t1, t2) <- liftIO $ readProcessWithExitCode "nix-prefetch-url" [txt ^. _Text] ""
-    case ec of
-        ExitSuccess -> return $ strip t1
-        ExitFailure _ -> do
-            log $ do
-                setSGR [SetColor Foreground Dull Red]
-                putStr "ERROR "
-                setSGR [SetColor Foreground Dull Yellow]
-                putStr $ "prefetching " ++ txt ^. _Text ++ " "
-                setSGR [Reset]
-                putStrLn $ t2 ^. _Text
-                exitFailure
-            return $ error "fetch failure"
+        logSGR [SetColor Foreground Dull Green]
+        logStr "fetch "
+        logSGR [Reset, SetColor Background Dull Black]
+        logStr "git"
+        logSGR [Reset]
+        logStr " "
+        logPrint uri
+    withSystemTempDirectory "npm2nix-git-" $ \ fp -> do
+        let uriStr = uriToString id (uri { uriFragment = "" }) ""
+            targetUri = (if "git+" `isPrefixOf` uriStr then drop 4 else id) uriStr
+            targetHash = case uriFragment uri of
+                             "#" -> "master"
+                             '#':bar -> bar
+                             _ -> "master"
+        _ <- runProc "git" ["clone", targetUri, fp]
+
+        _ <- runCreateProc $ (proc "git" ["checkout", targetHash]) { cwd = Just fp }
+
+        rev <- runCreateProc $ (proc "git" ["rev-parse", "@"]) { cwd = Just fp }
+
+        pkgJson'@PackageSpec{..} <- either error return =<< eitherDecodeStrict
+                                <$> liftIO (B.readFile (fp </> "package.json"))
+
+        src <- promise $ do
+            sha <- prefetchGit targetUri rev
+            return $ SourceGit (_Text # targetUri) sha rev
+
+        return pkgJson' { psMatch = psMatch { source = src } }
 
 showShortSpec :: Text -> Text -> String
-showShortSpec pkg txt = pkg ^. _Text ++ "@" ++ txt ^. _Text
+showShortSpec pkg txt = unpack pkg ++ "@" ++ unpack txt
 
 getDependencies :: MonadFetch m => PackageSpec -> m PackageTree
 getDependencies PackageSpec{..} = do
@@ -203,20 +215,23 @@ getDependencies PackageSpec{..} = do
                        }
 
 main :: IO ()
-main = execParser allOpts >>= \ o -> do
+main = withOpenSSL $ execParser allOpts >>= \ o -> do
     c <- getConf (userConfig o)
 
-    _tid <- fork $ forever $ join (readChan logChan)
+    tid <- myThreadId
+    _ <- fork $ runLoggingWithParent tid
 
     let registry = fromMaybe "https://registry.npmjs.org"
                  $ Conf.lookup "registry" c
-        authorization = Conf.lookup "_auth" c
+        authorization = toString . B64.decodeLenient . fromString <$> Conf.lookup "_auth" c
         fetcher = Fetcher{..}
 
     infile <- canonicalizePath (inFile o)
 
+    topSrcMV <- newMVar (SourceFile $ _Text # takeDirectory infile)
+
     pkgJson'@PackageSpec{..} <- either error return =<< eitherDecodeStrict <$> B.readFile infile
-    let pkgJson = pkgJson' { psMatch = psMatch { source = Just (SourceFile $ _Text # takeDirectory infile) } }
+    let pkgJson = pkgJson' { psMatch = psMatch { source = topSrcMV } }
 
     ptree@PackageTree{..} <- runReaderT (getDependencies pkgJson) fetcher
 
@@ -228,7 +243,7 @@ main = execParser allOpts >>= \ o -> do
         hPutStrLn h ""
         hPutStrLn h "{"
         let PackageSpec{ psMatch = m@PackageMatch{..} } = pkgJson
-        hPutStrLn h $ "  \"" ++ pmName ^. _Text ++ "\" = self.by-version." ++ showMatch m ++ ";"
+        hPutStrLn h $ "  \"" ++ unpack pmName ++ "\" = self.by-version." ++ showMatch m ++ ";"
         hPutStrLn h ""
         forM_ (M.toList $ reshape fakeReq) (hPrintTree h)
         hPutStrLn h "}"
@@ -246,9 +261,9 @@ hPrintTree h (PackageTree m@PackageMatch { pmName, version, bin = _, source } de
         hPutStrLn h $     "    self.by-version." ++ showMatch m ++ ";";
 
     hPutStrLn h $     "  by-version." ++ showMatch m ++ " = self.buildNodePackage {"
-    hPutStrLn h $     "    name = \"" ++ pmName ^. _Text ++ "\";"
-    hPutStrLn h $     "    version = \"" ++ renderSV version ^. _Text ++ "\";"
-    showSource h source
+    hPutStrLn h $     "    name = \"" ++ unpack pmName ++ "\";"
+    hPutStrLn h $     "    version = \"" ++ unpack (renderSV version) ++ "\";"
+    takeMVar source >>= showSource h
     hPutStrLn h       "    bin = false;"
     hPutStrLn h       "    deps = {";
     forM_ deps $ \ (req, ptree) ->
@@ -256,35 +271,36 @@ hPrintTree h (PackageTree m@PackageMatch { pmName, version, bin = _, source } de
     hPutStrLn h       "    };";
     hPutStrLn h       "  };"
     where
-        getTreeName PackageTree { ptMatch = PackageMatch { pmName = pmName' } } = pmName' ^. _Text
+        getTreeName PackageTree { ptMatch = PackageMatch { pmName = pmName' } } = unpack pmName'
 
-showSource :: Handle -> Maybe Source -> IO ()
-showSource h Nothing = hPutStrLn h "    src = builtins.abort \"Source unknown\";"
-showSource h (Just (SourceURL u s)) = do
+showSource :: Handle -> Source -> IO ()
+showSource h (SourceURL u s) = do
     hPutStrLn h $ "    src = fetchurl {"
-    hPutStrLn h $ "      url = \"" ++ u ^. _Text ++ "\";"
-    hPutStrLn h $ "      sha256 = \"" ++ s ^. _Text ++ "\";";
+    hPutStrLn h $ "      url = \"" ++ unpack u ++ "\";"
+    hPutStrLn h $ "      sha256 = \"" ++ unpack s ++ "\";";
     hPutStrLn h $ "    };"
-showSource h (Just (SourceGit u s r)) = do
-    hPutStrLn h $ "    src = fetchurl {"
-    hPutStrLn h $ "      url = \"" ++ u ^. _Text ++ "\";"
-    hPutStrLn h $ "      sha256 = \"" ++ s ^. _Text ++ "\";";
-    hPutStrLn h $ "      rev = \"" ++ r ^. _Text ++ "\";";
+showSource h (SourceGit u s r) = do
+    hPutStrLn h $ "    src = fetchgit {"
+    hPutStrLn h $ "      name = \"fetchgit-src\";"
+    hPutStrLn h $ "      url = \"" ++ unpack u ++ "\";"
+    hPutStrLn h $ "      sha256 = \"" ++ unpack s ++ "\";";
+    hPutStrLn h $ "      rev = \"" ++ unpack r ++ "\";";
     hPutStrLn h $ "    };"
-showSource h (Just (SourceFile f)) = do
+showSource h (SourceFile f) = do
     hPutStrLn h $ "    src = {"
-    hPutStrLn h $ "      outPath = " ++ f ^. _Text ++ ";";
+    hPutStrLn h $ "      outPath = " ++ unpack f ++ ";";
     hPutStrLn h $ "      name = \"src\";";
     hPutStrLn h $ "    };"
 
 showReq :: PackageReq -> String
-showReq (PackageReq n r) = "\"" ++ n ^. _Text ++ "\".\""
+showReq (PackageReq n r) = "\"" ++ unpack n ++ "\".\""
                                 ++ showReqText r ++ "\""
     where
-        showReqText (VersionRange (TaggedRange _ t)) = t ^. _Text
+        showReqText (VersionRange (TaggedRange _ t)) = unpack t
+        showReqText (Git uri) = uriToText uri
         showReqText e = error $ show e
 
 showMatch :: PackageMatch -> String
 showMatch PackageMatch { pmName, version } =
-    "\"" ++ pmName ^. _Text ++ "\".\""
-         ++ renderSV version ^. _Text ++ "\""
+    "\"" ++ unpack pmName ++ "\".\""
+         ++ unpack (renderSV version) ++ "\""
