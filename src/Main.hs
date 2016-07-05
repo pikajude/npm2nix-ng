@@ -30,6 +30,7 @@ import           Data.SemVer
 import qualified Data.Set                        as S
 import           Data.Text                       (Text)
 import           Data.Text.Lens
+-- import           Debug.Trace
 import           Logging
 import           Network.HTTP.Client.OpenSSL
 import           Network.URI
@@ -122,12 +123,14 @@ getSpec pkg = getCache specCache pkg $ do
     return $ resp ^. responseBody
 
 getSpecMatching :: MonadFetch m => PackageReq -> m PackageSpec
-getSpecMatching r@(PackageReq pkg vRange) = getCache reqCache r $ case vRange of
-    VersionRange tr -> getRegistryMatching pkg tr
-    GitHub _ -> logError $ string $ "getGitHubMatching " ++ show r
-    Git uri -> getGit uri
-    Http _ -> logError $ string $ "getTarballMatching " ++ show r
-    File _ -> logError $ string $ "file " ++ show r
+getSpecMatching r@(PackageReq pkg vRange) = getCache reqCache r $ do
+    sp <- case vRange of
+        VersionRange tr -> getRegistryMatching pkg tr
+        GitHub _ -> logError $ string $ "getGitHubMatching " ++ show r
+        Git uri -> getGit uri
+        Http _ -> logError $ string $ "getTarballMatching " ++ show r
+        File _ -> logError $ string $ "file " ++ show r
+    return sp { psReq = r }
 
 getRegistryMatching :: MonadFetch m => Text -> TaggedRange -> m PackageSpec
 getRegistryMatching pkg (TaggedRange targetSV targetText) = do
@@ -144,18 +147,22 @@ getRegistryMatching pkg (TaggedRange targetSV targetText) = do
             , "in"
             , string (show allVersions)
             ]
-    let spec2 = fromJSON $ spec ^?! key "versions" . key vers :: Result PackageSpec
+    let spec2 = fromJSON $ fromMaybe (error "missing versions.{?}")
+                         $ spec ^? key "versions" . key vers
     case spec2 of
         Data.Aeson.Success p@PackageSpec{..} -> do
             src <- getCache sourceCache psMatch $ do
-                let o = spec ^?! key "versions" . key vers . key "dist"
+                let o = fromMaybe (error "missing versions.{?}.dist")
+                      $ spec ^? key "versions" . key vers . key "dist"
                 promise $ do
-                    let tb = o ^?! key "tarball" . _String
+                    let tb = fromMaybe (error "missing tarball")
+                           $ o ^? key "tarball" . _String
                     shasum <- prefetchUrl tb
                     return $ SourceURL tb shasum
             return p { psMatch = psMatch { source = src } }
         Error s -> logError $ yellow ("fetching" <+> string (showShortSpec pkg targetText)) <+> string s
-                         <$$> string (show $ spec ^?! key "versions" . key vers)
+                         <$$> string (show $ fromMaybe (error "missing versions.{?}")
+                                           $ spec ^? key "versions" . key vers)
     where
         bestMatch' range vs = case filter (matches' range) vs of
             [] -> Left ("No matching versions" :: String)
@@ -196,17 +203,17 @@ getGit uri = do
 showShortSpec :: Text -> Text -> String
 showShortSpec pkg txt = unpack pkg ++ "@" ++ unpack txt
 
-gotten :: MVar (S.Set PackageSpec)
+gotten :: MVar (S.Set PackageReq)
 gotten = unsafePerformIO (newMVar mempty)
 {-# NOINLINE gotten #-}
 
 getDependencies :: MonadFetch m => PackageSpec -> m PackageTree
-getDependencies p@PackageSpec{..} = do
-    b <- S.member p <$> readMVar gotten
+getDependencies PackageSpec{..} = do
+    b <- S.member psReq <$> readMVar gotten
     if b
         then return $ CYCLE psMatch
         else do
-            modifyMVar_ gotten (return . S.insert p)
+            modifyMVar_ gotten (return . S.insert psReq)
             resolved <- mapConcurrently (getSpecMatching >=> getDependencies) psDependencies
             return PackageTree { ptMatch = psMatch
                                , ptDependencies = zip psDependencies resolved
@@ -231,7 +238,9 @@ main = withOpenSSL $ execParser allOpts >>= \ o -> do
     topSrcMV <- newMVar (SourceFile $ _Text # takeDirectory infile)
 
     pkgJson'@PackageSpec{..} <- either error return =<< eitherDecodeStrict <$> B.readFile infile
-    let pkgJson = pkgJson' { psMatch = psMatch { source = topSrcMV } }
+    let pkgJson = pkgJson' { psMatch = psMatch { source = topSrcMV }
+                           , psReq = PackageReq "<toplevel>" (case fromJSON "" of ~(Data.Aeson.Success a) -> a)
+                           }
 
     ptree@PackageTree{..} <- runReaderT (getDependencies pkgJson) fetcher
 
@@ -249,11 +258,13 @@ main = withOpenSSL $ execParser allOpts >>= \ o -> do
         hPutStrLn h "}"
 
 reshape :: (PackageReq, PackageTree) -> Map PackageTree (S.Set PackageReq)
-reshape (_, CYCLE _) = mempty
-reshape (req, tree@PackageTree { ptDependencies })
+reshape (req, tree)
     = treeMerge (M.singleton tree (S.singleton req))
-          (foldr (treeMerge . reshape) mempty ptDependencies)
+          (foldr (treeMerge . reshape) mempty deps)
         where treeMerge = M.unionWith (<>)
+              deps = case tree of
+                         PackageTree { ptDependencies } -> ptDependencies
+                         CYCLE _ -> []
 
 hPrintTree :: Handle -> (PackageTree, S.Set PackageReq) -> IO ()
 hPrintTree _ (CYCLE _, _) = return ()
@@ -268,14 +279,13 @@ hPrintTree h (PackageTree m@PackageMatch { pmName, version, bin = _, source } de
     readMVar source >>= showSource h
     hPutStrLn h       "    bin = false;"
     hPutStrLn h       "    deps = {";
-    forM_ deps $ \ (req, ptree) -> case ptree of
-        CYCLE _ -> return ()
-        _ -> hPutStrLn h $ "      \"" ++ getTreeName ptree ++ "\" = self.by-spec." ++ showReq req ++ ";"
+    forM_ deps $ \ (req, ptree) ->
+        hPutStrLn h $ "      \"" ++ getTreeName ptree ++ "\" = self.by-spec." ++ showReq req ++ ";"
     hPutStrLn h       "    };";
     hPutStrLn h       "  };"
     where
         getTreeName PackageTree { ptMatch = PackageMatch { pmName = pmName' } } = unpack pmName'
-        getTreeName (CYCLE (PackageMatch { pmName = pmName' })) = unpack pmName'
+        getTreeName (CYCLE PackageMatch { pmName = pmName' }) = unpack pmName'
 
 showSource :: Handle -> Source -> IO ()
 showSource h (SourceURL u s) = do

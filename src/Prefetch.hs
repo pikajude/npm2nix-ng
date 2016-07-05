@@ -4,9 +4,10 @@
 
 module Prefetch where
 
-import Control.Lens                 ((^?!))
+import Control.Lens                 ((^?))
 import Control.Monad.Reader
 import Data.Aeson.Lens
+import Data.Maybe
 import Data.Text                    (Text)
 import Logging
 import Network.URI
@@ -34,4 +35,8 @@ prefetchGit :: MonadFetch m => String -> Text -> m Text
 prefetchGit url rev = do
     log $ dullmagenta "nix-prefetch-git" <+> string url <+> string (unpack rev)
     out <- runProc "nix-prefetch-git" [url, unpack rev, "--fetch-submodules"]
-    return $ out ^?! key "sha256" . _String
+    case out ^? key "sha256" . _String of
+        Just s -> return s
+        Nothing -> do
+            liftIO $ print out
+            return $ error "missing sha256"

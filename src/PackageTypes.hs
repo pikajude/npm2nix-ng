@@ -72,7 +72,8 @@ data PackageMatch = PackageMatch
                   } deriving (Show, Ord, Eq)
 
 data PackageSpec = PackageSpec
-                 { psMatch            :: PackageMatch
+                 { psReq              :: PackageReq
+                 , psMatch            :: PackageMatch
                  , psDependencies     :: [PackageReq]
                  , psDevDependencies  :: [PackageReq]
                  , psPeerDependencies :: [PackageReq]
@@ -83,7 +84,9 @@ data PackageTree = PackageTree
                  , ptDependencies     :: [(PackageReq, PackageTree)]
                  , ptDevDependencies  :: [(PackageReq, PackageTree)]
                  , ptPeerDependencies :: [(PackageReq, PackageTree)]
-                 } | CYCLE PackageMatch deriving Show
+                 }
+                 | CYCLE PackageMatch
+                 deriving Show
 
 instance Eq PackageTree where
     PackageTree m _ _ _ == PackageTree m1 _ _ _ = m == m1
@@ -99,7 +102,7 @@ instance Ord PackageTree where
 instance FromJSON PackageSpec where
     parseJSON (Object v) = do
         match <- parseJSON (Object v)
-        (\ d w p -> PackageSpec match (f d) (f w) (f p))
+        (\ d w p -> PackageSpec undefined match (f d) (f w) (f p))
             <$> v .:? "dependencies" .!= mempty
             <*> v .:? "devDependencies" .!= mempty
             <*> v .:? "peerDependencies" .!= mempty
