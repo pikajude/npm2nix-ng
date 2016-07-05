@@ -127,6 +127,7 @@ getSpecMatching r@(PackageReq pkg vRange) = getCache reqCache r $ case vRange of
     GitHub _ -> logError $ string $ "getGitHubMatching " ++ show r
     Git uri -> getGit uri
     Http _ -> logError $ string $ "getTarballMatching " ++ show r
+    File _ -> logError $ string $ "file " ++ show r
 
 getRegistryMatching :: MonadFetch m => Text -> TaggedRange -> m PackageSpec
 getRegistryMatching pkg (TaggedRange targetSV targetText) = do
@@ -195,14 +196,23 @@ getGit uri = do
 showShortSpec :: Text -> Text -> String
 showShortSpec pkg txt = unpack pkg ++ "@" ++ unpack txt
 
+gotten :: MVar (S.Set PackageSpec)
+gotten = unsafePerformIO (newMVar mempty)
+{-# NOINLINE gotten #-}
+
 getDependencies :: MonadFetch m => PackageSpec -> m PackageTree
-getDependencies PackageSpec{..} = do
-    resolved <- mapConcurrently (getSpecMatching >=> getDependencies) psDependencies
-    return PackageTree { ptMatch = psMatch
-                       , ptDependencies = zip psDependencies resolved
-                       , ptDevDependencies = []
-                       , ptPeerDependencies = []
-                       }
+getDependencies p@PackageSpec{..} = do
+    b <- S.member p <$> readMVar gotten
+    if b
+        then return $ CYCLE psMatch
+        else do
+            modifyMVar_ gotten (return . S.insert p)
+            resolved <- mapConcurrently (getSpecMatching >=> getDependencies) psDependencies
+            return PackageTree { ptMatch = psMatch
+                               , ptDependencies = zip psDependencies resolved
+                               , ptDevDependencies = []
+                               , ptPeerDependencies = []
+                               }
 
 main :: IO ()
 main = withOpenSSL $ execParser allOpts >>= \ o -> do
@@ -239,12 +249,14 @@ main = withOpenSSL $ execParser allOpts >>= \ o -> do
         hPutStrLn h "}"
 
 reshape :: (PackageReq, PackageTree) -> Map PackageTree (S.Set PackageReq)
+reshape (_, CYCLE _) = mempty
 reshape (req, tree@PackageTree { ptDependencies })
     = treeMerge (M.singleton tree (S.singleton req))
           (foldr (treeMerge . reshape) mempty ptDependencies)
         where treeMerge = M.unionWith (<>)
 
 hPrintTree :: Handle -> (PackageTree, S.Set PackageReq) -> IO ()
+hPrintTree _ (CYCLE _, _) = return ()
 hPrintTree h (PackageTree m@PackageMatch { pmName, version, bin = _, source } deps _ _, reqs) = do
     forM_ (S.toList reqs) $ \ req -> do
         hPutStrLn h $     "  by-spec." ++ showReq req ++ " =";
@@ -253,15 +265,17 @@ hPrintTree h (PackageTree m@PackageMatch { pmName, version, bin = _, source } de
     hPutStrLn h $     "  by-version." ++ showMatch m ++ " = self.buildNodePackage {"
     hPutStrLn h $     "    name = \"" ++ unpack pmName ++ "\";"
     hPutStrLn h $     "    version = \"" ++ unpack (renderSV version) ++ "\";"
-    takeMVar source >>= showSource h
+    readMVar source >>= showSource h
     hPutStrLn h       "    bin = false;"
     hPutStrLn h       "    deps = {";
-    forM_ deps $ \ (req, ptree) ->
-        hPutStrLn h $ "      \"" ++ getTreeName ptree ++ "\" = self.by-spec." ++ showReq req ++ ";"
+    forM_ deps $ \ (req, ptree) -> case ptree of
+        CYCLE _ -> return ()
+        _ -> hPutStrLn h $ "      \"" ++ getTreeName ptree ++ "\" = self.by-spec." ++ showReq req ++ ";"
     hPutStrLn h       "    };";
     hPutStrLn h       "  };"
     where
         getTreeName PackageTree { ptMatch = PackageMatch { pmName = pmName' } } = unpack pmName'
+        getTreeName (CYCLE (PackageMatch { pmName = pmName' })) = unpack pmName'
 
 showSource :: Handle -> Source -> IO ()
 showSource h (SourceURL u s) = do

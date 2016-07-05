@@ -44,6 +44,7 @@ data Req = VersionRange TaggedRange
          | GitHub URI
          | Git URI
          | Http URI
+         | File URI
          deriving (Eq, Ord, Show)
 
 data PackageReq = PackageReq
@@ -75,14 +76,25 @@ data PackageSpec = PackageSpec
                  , psDependencies     :: [PackageReq]
                  , psDevDependencies  :: [PackageReq]
                  , psPeerDependencies :: [PackageReq]
-                 } deriving (Show, Eq)
+                 } deriving (Show, Ord, Eq)
 
 data PackageTree = PackageTree
                  { ptMatch            :: PackageMatch
                  , ptDependencies     :: [(PackageReq, PackageTree)]
                  , ptDevDependencies  :: [(PackageReq, PackageTree)]
                  , ptPeerDependencies :: [(PackageReq, PackageTree)]
-                 } deriving (Show, Ord, Eq)
+                 } | CYCLE PackageMatch deriving Show
+
+instance Eq PackageTree where
+    PackageTree m _ _ _ == PackageTree m1 _ _ _ = m == m1
+    CYCLE a == CYCLE b = a == b
+    _ == _ = False
+
+instance Ord PackageTree where
+    compare (PackageTree m _ _ _) (PackageTree m1 _ _ _) = compare m m1
+    compare (CYCLE a) (CYCLE b) = compare a b
+    compare PackageTree{} CYCLE{} = GT
+    compare CYCLE{} PackageTree{} = LT
 
 instance FromJSON PackageSpec where
     parseJSON (Object v) = do
@@ -116,6 +128,7 @@ instance FromJSON Req where
                     _ -> fail $ uriPath uri ++ " doesn't look like a valid github req"
                 x | x `elem` ["git+https:", "git+http:", "git:"] -> pure (Git uri)
                 x | x `elem` ["https:", "http:"] -> pure (Http uri)
+                x | x `elem` ["file:"] -> pure (File uri)
                 _ -> fail $ "unreadable URI " ++ show uri
             Nothing -> fail $ (s ^. _Text) ++ " not a URI nor a version"
 
