@@ -252,7 +252,10 @@ main = withOpenSSL $ execParser allOpts >>= \ o -> do
         hPutStrLn h ""
         hPutStrLn h "{"
         let PackageSpec{ psMatch = m@PackageMatch{..} } = pkgJson
-        hPutStrLn h $ "  \"" ++ unpack pmName ++ "\" = self.by-version." ++ showMatch m ++ ";"
+        if pmName == "deps"
+            then forM_ (ptDependencies ++ ptDevDependencies ++ ptPeerDependencies) $ \ (req, tree) ->
+                hPutStrLn h $ "  \"" ++ unpack (prName req) ++ "\" = self.by-version." ++ showMatch (PackageTypes.ptMatch tree) ++ ";"
+            else hPutStrLn h $ "  \"" ++ unpack pmName ++ "\" = self.by-version." ++ showMatch m ++ ";"
         hPutStrLn h ""
         forM_ (M.toList $ reshape fakeReq) (hPrintTree h)
         hPutStrLn h "}"
@@ -268,7 +271,9 @@ reshape (req, tree)
 
 hPrintTree :: Handle -> (PackageTree, S.Set PackageReq) -> IO ()
 hPrintTree _ (CYCLE _, _) = return ()
-hPrintTree h (PackageTree m@PackageMatch { pmName, version, bin = _, source } deps _ _, reqs) = do
+hPrintTree h (PackageTree m@PackageMatch { pmName, version, bin = _, source } deps _ _, reqs)
+    | pmName == "deps" = return ()
+    | otherwise = do
     forM_ (S.toList reqs) $ \ req -> do
         hPutStrLn h $     "  by-spec." ++ showReq req ++ " =";
         hPutStrLn h $     "    self.by-version." ++ showMatch m ++ ";";

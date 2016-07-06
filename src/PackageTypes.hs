@@ -108,7 +108,19 @@ instance FromJSON PackageSpec where
             <*> v .:? "peerDependencies" .!= mempty
             where f = map (uncurry PackageReq) . M.toList
 
+    parseJSON (Array a) = (\ d -> PackageSpec undefined fakeMatch d [] [])
+        <$> mapM parseJSON (a ^.. traverse)
+        where fakeMatch = PackageMatch "deps" (SemVer 0 0 0 []) (error "source not registered") False
+
     parseJSON q = typeMismatch "PackageSpec" q
+
+instance FromJSON PackageReq where
+    parseJSON (String s) = pure (PackageReq s (VersionRange (TaggedRange (Geq (SemVer 0 0 0 [])) "*")))
+    parseJSON (Object o)
+        | [(pkg, vers)] <- H.toList o = PackageReq pkg <$> parseJSON vers
+        | otherwise = fail "Error trying to parse top-level dependencies: objects should only have one key and value"
+
+    parseJSON q = typeMismatch "PackageReq" q
 
 instance FromJSON PackageMatch where
     parseJSON (Object v) = PackageMatch
