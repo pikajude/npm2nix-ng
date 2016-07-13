@@ -25,6 +25,7 @@ executable npm2nix
                      , lens-aeson
                      , lifted-async
                      , lifted-base
+                     , memory-cache
                      , monad-control
                      , mtl
                      , network-uri

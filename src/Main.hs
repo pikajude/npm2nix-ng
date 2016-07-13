@@ -22,6 +22,7 @@ import qualified Data.ByteString                 as B
 import qualified Data.ByteString.Base64          as B64
 import           Data.ByteString.Lazy            (ByteString)
 import           Data.ByteString.UTF8            (fromString, toString)
+import           Data.Cache
 import           Data.List                       (isPrefixOf)
 import           Data.Map                        (Map)
 import qualified Data.Map                        as M
@@ -49,6 +50,15 @@ import           System.IO.Unsafe
 import           System.Process                  (CreateProcess (..), proc)
 import           Text.PrettyPrint.ANSI.Leijen    hiding ((<$>), (</>), (<>))
 import           Types
+
+sourceCache, reqCache, specCache :: Ord k => Cache k v
+
+sourceCache = unsafePerformIO mkCacheIO
+{-# NOINLINE sourceCache #-}
+reqCache = unsafePerformIO mkCacheIO
+{-# NOINLINE reqCache #-}
+specCache = unsafePerformIO mkCacheIO
+{-# NOINLINE specCache #-}
 
 promise :: MonadBaseControl IO m => m a -> m (MVar a)
 promise io = do
@@ -81,39 +91,8 @@ requestOpts = do
             .~ maybeToList (fmap (mappend "Basic " . B64.encode . fromString) authorization)
         & manager .~ Left (opensslManagerSettings context)
 
-type Memcache key value = MVar (Map key (MVar value))
-
-getCache :: (MonadBaseControl IO m, Ord key)
-         => Memcache key value -> key -> m value -> m value
-getCache cache k seeder = do
-    (target, shouldWait) <- modifyMVar cache $ \ c ->
-        case M.lookup k c of
-            Just mv -> return (c, (mv, True))
-            Nothing -> do
-                v <- newEmptyMVar
-                return (M.insert k v c, (v, False))
-
-    if shouldWait
-        then readMVar target
-        else do
-            result <- seeder
-            putMVar target result
-            return result
-
-specCache :: Memcache Text ByteString
-specCache = unsafePerformIO $ newMVar mempty
-{-# NOINLINE specCache #-}
-
-reqCache :: Memcache PackageReq PackageSpec
-reqCache = unsafePerformIO $ newMVar mempty
-{-# NOINLINE reqCache #-}
-
-sourceCache :: Memcache PackageMatch (MVar Source)
-sourceCache = unsafePerformIO $ newMVar mempty
-{-# NOINLINE sourceCache #-}
-
 getSpec :: MonadFetch m => Text -> m ByteString
-getSpec pkg = getCache specCache pkg $ do
+getSpec pkg = fetch specCache pkg $ do
     Fetcher{..} <- ask
     r <- requestOpts
     log $ dullgreen "fetch"
@@ -123,7 +102,7 @@ getSpec pkg = getCache specCache pkg $ do
     return $ resp ^. responseBody
 
 getSpecMatching :: MonadFetch m => PackageReq -> m PackageSpec
-getSpecMatching r@(PackageReq pkg vRange) = getCache reqCache r $ do
+getSpecMatching r@(PackageReq pkg vRange) = fetch reqCache r $ do
     sp <- case vRange of
         VersionRange tr -> getRegistryMatching pkg tr
         GitHub _ -> logError $ string $ "getGitHubMatching " ++ show r
@@ -151,7 +130,7 @@ getRegistryMatching pkg (TaggedRange targetSV targetText) = do
                          $ spec ^? key "versions" . key vers
     case spec2 of
         Data.Aeson.Success p@PackageSpec{..} -> do
-            src <- getCache sourceCache psMatch $ do
+            src <- fetch sourceCache psMatch $ do
                 let o = fromMaybe (error "missing versions.{?}.dist")
                       $ spec ^? key "versions" . key vers . key "dist"
                 promise $ do
@@ -275,8 +254,8 @@ hPrintTree h (PackageTree m@PackageMatch { pmName, version, bin = _, source } de
     | pmName == "deps" = return ()
     | otherwise = do
     forM_ (S.toList reqs) $ \ req -> do
-        hPutStrLn h $     "  by-spec." ++ showReq req ++ " =";
-        hPutStrLn h $     "    self.by-version." ++ showMatch m ++ ";";
+        hPutStrLn h $ "  by-spec." ++ showReq req ++ " =";
+        hPutStrLn h $ "    self.by-version." ++ showMatch m ++ ";";
 
     hPutStrLn h $     "  by-version." ++ showMatch m ++ " = self.buildNodePackage {"
     hPutStrLn h $     "    name = \"" ++ unpack pmName ++ "\";"
